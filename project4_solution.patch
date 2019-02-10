@@ -1,0 +1,880 @@
+diff --git a/include/syscall.h b/include/syscall.h
+index c55cec2..0c47f23 100644
+--- a/include/syscall.h
++++ b/include/syscall.h
+@@ -23,5 +23,9 @@
+ #define SYS_sbrk   19
+ #define SYS_sleep  20
+ #define SYS_uptime 21
++#define SYS_tagFile 22
++#define SYS_removeFileTag 23
++#define SYS_getFileTag 24
++#define SYS_getAllTags 25
+ 
+ #endif // _SYSCALL_H_
+diff --git a/include/types.h b/include/types.h
+index cfcdb4a..a5b2c09 100644
+--- a/include/types.h
++++ b/include/types.h
+@@ -3,6 +3,10 @@
+ 
+ // Type definitions
+ 
++struct Key {
++  char key[10];  // at most 10 bytes for key
++};
++
+ typedef unsigned int   uint;
+ typedef unsigned short ushort;
+ typedef unsigned char  uchar;
+diff --git a/kernel/defs.h b/kernel/defs.h
+index c12f8ff..968883f 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,7 @@ struct pipe;
+ struct proc;
+ struct spinlock;
+ struct stat;
++struct Key;
+ 
+ // bio.c
+ void            binit(void);
+@@ -51,6 +52,12 @@ struct inode*   nameiparent(char*, char*);
+ int             readi(struct inode*, char*, uint, uint);
+ void            stati(struct inode*, struct stat*);
+ int             writei(struct inode*, char*, uint, uint);
++struct Tag*	findTagByKey(char*, uchar*);
++struct Tag*	findEmpty(uchar*);
++int             tagFile(int, char*, char*, int);
++int		removeFileTag(int, char*);
++int		getFileTag(int, char*, char*, int);
++int		getAllTags(int, struct Key*, int);
+ 
+ // ide.c
+ void            ideinit(void);
+diff --git a/kernel/file.h b/kernel/file.h
+index e4e4119..8e9bc22 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -25,6 +25,13 @@ struct inode {
+   short nlink;
+   uint size;
+   uint addrs[NDIRECT+1];
++  uint tags;
++};
++
++struct Tag {
++  char key[10];		// at most 10 bytes for key, including NULL
++  char value[18];	// at most 18 bytes for value, including NULL
++  int exists; 		// 4 bytes for showing if this tag exists
+ };
+ 
+ #define I_BUSY 0x1
+diff --git a/kernel/fs.c b/kernel/fs.c
+index 2d519b0..f8f6705 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -611,3 +611,277 @@ nameiparent(char *path, char *name)
+ {
+   return namex(path, 1, name);
+ }
++
++struct Tag*
++findTagByKey(char *key, uchar *bdata)
++{ 
++  struct Tag *t;
++  int i;
++  int keyLength;
++  
++  keyLength = strlen(key);
++ 
++  for (i = 0, t = (struct Tag *)bdata; i < 16; i++, t++) {
++    if (strncmp(t->key, key, keyLength) == 0) {
++      return t;
++    }
++  }
++  
++  return 0;
++}
++
++struct Tag*
++findEmpty(uchar *bdata)
++{
++  struct Tag *t;
++  int i;
++
++  for (i = 0, t = (struct Tag *)bdata; i < 16; i++, t++) {
++    if (!t->exists) {
++      return t;
++    }
++  }
++
++  return 0;
++}
++
++int
++tagFile(int fileDescriptor, char* key, char* value, int valueLength)
++{
++  struct file *f;
++  int keyLength;  
++  struct buf *bp;
++  uchar* bdata;
++  struct Tag *t; 
++
++  // arguments check begin
++  if (fileDescriptor < 0 || fileDescriptor >= NOFILE || (f = proc->ofile[fileDescriptor]) == NULL || !f->writable || !f->ip) {
++    return -1;
++  }
++  
++  if (!key) {
++    return -1;
++  }
++
++  keyLength = strlen(key);
++  if (keyLength < 1 || keyLength > 9) {
++    return -1;
++  }
++
++  if (valueLength < 0 || valueLength > 18) { 
++    return -1;
++  }
++
++  // argument check end
++
++  ilock(f->ip);
++
++  if (!f->ip->tags) {
++    f->ip->tags = balloc(f->ip->dev);
++  }
++  bp = bread(f->ip->dev, f->ip->tags);
++
++  bdata = (uchar*)bp->data;
++
++  // no empty space for new tag
++  if (!(t = findTagByKey(key, bdata)) && !(t = findEmpty(bdata))) {
++    brelse(bp);
++    iunlock(f->ip);
++    return -1;
++  }
++
++  // set tag
++  memset(t->key, '\0', 10);
++  memset(t->value, '\0', 18);
++  strncpy(t->key, key, keyLength);
++  strncpy(t->value, value, valueLength);
++  t->exists = 1;
++
++  /*
++  cprintf("current tag info after tagging.\n");
++  struct Tag *tt;
++  int i;
++  for (i = 0, tt = (struct Tag *)bdata; i < 16; i++, tt++) {
++    cprintf("tag %d: (%s,%s,%d)\n",i,tt->key,tt->value,tt->exists);
++  }
++  */
++
++  bwrite(bp);
++  brelse(bp);
++  iunlock(f->ip);
++
++  return 1;
++}
++
++int
++removeFileTag(int fileDescriptor, char* key)
++{
++  struct file *f;
++  int keyLength;
++  struct buf *bp;
++  uchar* bdata;
++  struct Tag *t;
++
++  // argument check begin
++  if (fileDescriptor < 0 || fileDescriptor >= NOFILE || (f = proc->ofile[fileDescriptor]) == NULL || !f->writable || !f->ip) {
++    return -1;
++  }
++
++  if (!key) {
++    return -1;
++  }
++
++  keyLength = strlen(key);
++  if (keyLength < 1 || keyLength > 9) {
++    return -1;
++  }
++
++  // argument check end  
++
++  ilock(f->ip);
++  bp = bread(f->ip->dev, f->ip->tags);
++  bdata = (uchar *)bp->data;
++
++  // do nothing if the key doesn't exist
++  if (!(t = findTagByKey(key, bdata))) {
++    brelse(bp);
++    iunlock(f->ip);
++    return -1;
++  }
++
++  // clear the tag
++  memset(t, 0, 32);
++  //memset(t->key, '\0', 10);
++  //memset(t->value, '\0', 18);
++  //t->exists = 0;
++  
++  bwrite(bp);
++  brelse(bp);
++  iunlock(f->ip);
++
++  /*
++  cprintf("current tag info after removing tags.\n");
++  struct Tag *tt;
++  int i;
++  for (i = 0, tt = (struct Tag *)bdata; i < 16; i++, tt++) {
++    cprintf("tag %d: (%s,%s,%d)\n",i,tt->key,tt->value,tt->exists);
++  }
++  */
++
++  return 1;
++}
++
++int
++getFileTag(int fileDescriptor, char* key, char* buffer, int length)
++{
++  struct file *f;
++  int keyLength;
++  int valueLength;
++  struct buf *bp;
++  uchar* bdata;
++  struct Tag *t;
++ 
++  // argument check begin 
++  if (fileDescriptor < 0 || fileDescriptor >= NOFILE || (f = proc->ofile[fileDescriptor]) == NULL || !f->readable || !f->ip) {
++    return -1;
++  }
++
++  if (!key) {
++    return -1;
++  }
++
++  keyLength = strlen(key);
++  if (keyLength < 1 || keyLength > 9) {
++    return -1;
++  }
++
++  if (!buffer) {
++    return -1;
++  }
++
++  if (length < 0) {
++    return -1;
++  }
++
++  if (length > 18) {
++    length = 18;
++  }
++
++  // argument check end
++
++  ilock(f->ip);
++
++  if (!f->ip->tags) {
++    f->ip->tags = balloc(f->ip->dev);
++  }
++  bp = bread(f->ip->dev, f->ip->tags);
++
++  bdata = (uchar*)bp->data;
++
++  // do nothing if key doesn't exist
++  if (!(t = findTagByKey(key, bdata))) {
++    brelse(bp);
++    iunlock(f->ip);
++    return -1;
++  }
++
++  valueLength = strlen(t->value);
++
++  strncpy(buffer, t->value, length);
++
++  /*
++  cprintf("current tag info when getting file tags.\n");
++  struct Tag *tt;
++  int i;
++  for (i = 0, tt = (struct Tag *)bdata; i < 16; i++, tt++) {
++    cprintf("tag %d: (%s,%s,%d)\n",i,tt->key,tt->value,tt->exists);
++  }
++  */
++ 
++  brelse(bp);
++  iunlock(f->ip);
++
++  return valueLength > 18 ? 18 : valueLength;
++}
++
++
++int
++getAllTags(int fileDescriptor, struct Key keys[], int maxTags)
++{
++  struct file *f;
++  struct buf *bp;
++  uchar* bdata;
++  struct Tag *t;
++  int i;
++  int cnt;
++
++  // argument check
++  if (fileDescriptor < 0 || fileDescriptor >= NOFILE || (f = proc->ofile[fileDescriptor]) == NULL || !f->readable || !f->ip) {
++    return -1;
++  }
++
++  ilock(f->ip);
++
++  bp = bread(f->ip->dev, f->ip->tags);
++  bdata = (uchar *)bp->data;
++
++  // find tag by key, read key to output and count
++  for (i = 0, t = (struct Tag *)bdata, cnt = 0; i < 16 && cnt < maxTags; i++, t++) {
++    if (t->exists) {
++      strncpy(keys[cnt++].key, t->key, strlen(t->key));
++    }
++  }
++
++  /*
++  cprintf("current tag info when getting all tags.\n");
++  struct Tag *tt;
++  for (i = 0, tt = (struct Tag *)bdata; i < 16; i++, tt++) {
++    cprintf("tag %d: (%s,%s,%d)\n",i,tt->key,tt->value,tt->exists);
++  }
++  */
++
++  brelse(bp);
++  iunlock(f->ip);
++  
++  return cnt;
++}
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 28c8308..8c5e5f8 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,10 @@ static int (*syscalls[])(void) = {
+ [SYS_wait]    sys_wait,
+ [SYS_write]   sys_write,
+ [SYS_uptime]  sys_uptime,
++[SYS_tagFile] sys_tagFile,
++[SYS_removeFileTag] sys_removeFileTag,
++[SYS_getFileTag] sys_getFileTag,
++[SYS_getAllTags] sys_getAllTags,
+ };
+ 
+ // Called on a syscall trap. Checks that the syscall number (passed via eax)
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 89b2ee6..61f6945 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -390,3 +390,60 @@ sys_pipe(void)
+   fd[1] = fd1;
+   return 0;
+ }
++
++int
++sys_tagFile(void)
++{
++  int fd;
++  char *key;
++  char *value;
++  int valueLength;
++
++  if (argint(0, &fd) < 0 || argstr(1, &key) < 0 || argstr(2, &value) < 0 || argint(3, &valueLength) < 0) {
++    return -1;
++  }
++
++  return tagFile(fd, key, value, valueLength);
++}
++
++int
++sys_removeFileTag(void)
++{
++  int fd;
++  char* key;
++  
++  if (argint(0, &fd) < 0 || argstr(1, &key) < 0) {
++    return -1;
++  }
++
++  return removeFileTag(fd, key);
++}
++
++int
++sys_getFileTag(void)
++{
++  int fd;
++  char* key;
++  char* buf;
++  int length;
++
++  if (argint(0, &fd) < 0 || argstr(1, &key) < 0 || argstr(2, &buf) < 0 || argint(3, &length) < 0) {
++    return -1;
++  }
++
++  return getFileTag(fd, key, buf, length);
++}
++
++int
++sys_getAllTags(void)
++{
++  int fd;
++  struct Key *keys;
++  int maxTags;
++
++  if (argint(0, &fd) < 0 || argint(2, &maxTags) < 0 || argptr(1, (char**)&keys, sizeof(struct Key *)* maxTags) < 0) {
++    return -1;
++  }
++  
++  return getAllTags(fd, keys, maxTags);
++}
+diff --git a/kernel/sysfunc.h b/kernel/sysfunc.h
+index ee9dafd..d1ba4e8 100644
+--- a/kernel/sysfunc.h
++++ b/kernel/sysfunc.h
+@@ -23,5 +23,9 @@ int sys_unlink(void);
+ int sys_wait(void);
+ int sys_write(void);
+ int sys_uptime(void);
++int sys_tagFile(void);
++int sys_removeFileTag(void);
++int sys_getFileTag(void);
++int sys_getAllTags(void);
+ 
+ #endif // _SYSFUNC_H_
+diff --git a/user/getalltagtest.c b/user/getalltagtest.c
+new file mode 100644
+index 0000000..c04fa14
+--- /dev/null
++++ b/user/getalltagtest.c
+@@ -0,0 +1,35 @@
++#include "types.h"
++#include "user.h"
++
++#define O_RDONLY 0x000
++#define O_WRONLY 0x001
++#define O_RDWR 0x002
++#define O_CREATE 0x200
++
++int
++main(int argc, char *argv[])
++{
++ int fd = open("ls", O_RDONLY);
++
++ struct Key keys[16];
++ int numTags = getAllTags(fd, keys, 16);
++ if(numTags < 0){
++   exit();
++ }
++
++ if(numTags > 16){
++   numTags = 16;
++ }
++ char buffer[18];
++ int i;
++ printf(1, "Here is a list of this file's tags:\n");
++ for(i = 0; i < numTags; i++){
++   int res = getFileTag(fd, keys[i].key, buffer, 18);
++   if(res > 0){
++     printf(1, "%s: %s\n", keys[i].key, buffer);
++   }
++ }
++ close(fd);
++
++ exit();
++}
+diff --git a/user/gettagtest.c b/user/gettagtest.c
+new file mode 100644
+index 0000000..a706133
+--- /dev/null
++++ b/user/gettagtest.c
+@@ -0,0 +1,27 @@
++#include "types.h"
++#include "user.h"
++
++#define O_RDONLY 0x000
++#define O_WRONLY 0x001
++#define O_RDWR 0x002
++#define O_CREATE 0x200
++
++int
++main(int argc, char *argv[])
++{
++ int fd = open("ls", O_RDONLY);
++
++ char* key = "type";
++ char buffer[18];
++ int res = getFileTag(fd, key, buffer, 18);
++ if(res < 18){
++   printf(1, "%s: %s\n", key, buffer);
++ } else{
++   printf(1, "buffer too small.\n");
++ }
++
++ close(fd);
++
++ exit();
++}
++
+diff --git a/user/makefile.mk b/user/makefile.mk
+index 1441eb8..fe2f59f 100644
+--- a/user/makefile.mk
++++ b/user/makefile.mk
+@@ -16,7 +16,11 @@ USER_PROGS := \
+ 	tester\
+ 	usertests\
+ 	wc\
+-	zombie
++	zombie\
++	tagfiletest\
++	removetagtest\
++	gettagtest\
++	getalltagtest\
+ 
+ USER_PROGS := $(addprefix user/, $(USER_PROGS))
+ 
+diff --git a/user/removetagtest.c b/user/removetagtest.c
+new file mode 100644
+index 0000000..010d9e0
+--- /dev/null
++++ b/user/removetagtest.c
+@@ -0,0 +1,23 @@
++#include "types.h"
++#include "user.h"
++
++#define O_RDONLY 0x000
++#define O_WRONLY 0x001
++#define O_RDWR 0x002
++#define O_CREATE 0x200
++
++int
++main(int argc, char *argv[])
++{
++ int fd = open("ls", O_RDWR);
++
++ char* key = "type";
++ int res = removeFileTag(fd, key); // removes the tag with key "type"
++ if(res < 0){
++   printf(1, "removeFileTag error.\n");
++ }
++
++ close(fd);
++
++ exit();
++}
+diff --git a/user/tagfiletest.c b/user/tagfiletest.c
+new file mode 100644
+index 0000000..11af09c
+--- /dev/null
++++ b/user/tagfiletest.c
+@@ -0,0 +1,25 @@
++#include "types.h"
++#include "user.h"
++
++#define O_RDONLY 0x000
++#define O_WRONLY 0x001
++#define O_RDWR 0x002
++#define O_CREATE 0x200
++
++int
++main(int argc, char *argv[])
++{
++ int fd = open("ls", O_RDWR);
++
++ char* key = "type";
++ char* val = "utility";
++ int len = 7;
++ int res = tagFile(fd, key, val, len); // tag file as "type": "utility"
++ if(res < 0){
++  printf(1, "tagFile error.\n");
++ }
++
++ close(fd);
++
++ exit();
++}
+diff --git a/user/umalloc.c b/user/umalloc.c
+index 94a8d47..a7e7d2c 100644
+--- a/user/umalloc.c
++++ b/user/umalloc.c
+@@ -6,122 +6,85 @@
+ // Memory allocator by Kernighan and Ritchie,
+ // The C programming Language, 2nd ed.  Section 8.7.
+ 
+-typedef long Align;  // for alignment to long boundary
++typedef long Align;
+ 
+-union header {  // block header
++union header {
+   struct {
+-    union header *ptr; // next block, if on free list
+-    uint size;         // size of this block (in multiples of 8 bytes)
++    union header *ptr;
++    uint size;
+   } s;
+-  Align x;  // force alignment of blocks
++  Align x;
+ };
+ 
+ typedef union header Header;
+ 
+-// global variables:
+-static Header base;   // the first free list node
+-static Header *freep; // start of the free list (head)
++static Header base;
++static Header *freep;
+ 
+-// put new block "ap" on the free list because we're done using it
+-void free(void *ap) {
+-  Header *bp = (Header*)ap - 1;  // the block header
++void
++free(void *ap)
++{
++  Header *bp, *p;
+ 
+-  // Scan through the free list looking for the right place to insert.
+-  // Stop when we find a block p that is before the new block,
+-  // but the new block is before p's "right neighbor"
+-  Header *p;
+-  for(p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr) {
+-    // There is a special case when the new block belongs at the start or end.
+-    // If the scan got to the block with the highest address,
+-    // and the new block is > the highest, or < the lowest
+-    if(p >= p->s.ptr && (bp > p || bp < p->s.ptr)) {
+-      break;  // block is at the start or end of the range
+-    }
+-  }
+-  // p will become the new block's "left neighbor" so insert after it,
+-  // but first check whether to coalesce.
+-  
+-  // if the end of the new block touches the right neighbor, coalesce-right
++  bp = (Header*)ap - 1;
++  for(p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
++    if(p >= p->s.ptr && (bp > p || bp < p->s.ptr))
++      break;
+   if(bp + bp->s.size == p->s.ptr){
+-    bp->s.size += p->s.ptr->s.size;  // add the size of the right neighbor
+-    bp->s.ptr = p->s.ptr->s.ptr;     // point to the neighbor's neighbor
+-  }
+-  // if there is a gap to the right, just point to the right neighbor
+-  else bp->s.ptr = p->s.ptr;
+-
+-  // if the end of left neighbor touches the new block's start, coalesce-left
++    bp->s.size += p->s.ptr->s.size;
++    bp->s.ptr = p->s.ptr->s.ptr;
++  } else
++    bp->s.ptr = p->s.ptr;
+   if(p + p->s.size == bp){
+-    p->s.size += bp->s.size;  // add the new block's size to the left neighbor
+-    p->s.ptr = bp->s.ptr;     // make the left neighbor point to the right neighbor
+-  }
+-  // if there is a gap to the left, the left neighbor points to the new block
+-  else p->s.ptr = bp;
+-
+-  freep = p;  // change the start of the free list to point to the freed block
++    p->s.size += bp->s.size;
++    p->s.ptr = bp->s.ptr;
++  } else
++    p->s.ptr = bp;
++  freep = p;
+ }
+ 
+-// minumum number of units to request
+-#define NALLOC 4096
++static Header*
++morecore(uint nu)
++{
++  char *p;
++  Header *hp;
+ 
+-// ask the OS for more memory
+-static Header* morecore(uint nu) {
+-  if(nu < NALLOC){  // never ask for just a tiny bit of memory
+-    nu = NALLOC;
+-  }
+-  // sbrk asks the OS to let us use more memory at the end of
+-  // the address space and returns a pointer to the beginning
+-  // of the new chunk
+-  char* p = sbrk(nu * sizeof(Header));
+-  // on failure, sbrk will return -1
+-  if(p == (char*)-1){
++  if(nu < 4096)
++    nu = 4096;
++  p = sbrk(nu * sizeof(Header));
++  if(p == (char*)-1)
+     return 0;
+-  }
+-  Header *hp = (Header*)p;  // cast the new memory as a Header*
+-  hp->s.size = nu;  // set up the new header
+-  free((void*)(hp + 1));  // add the new memory to the free list
++  hp = (Header*)p;
++  hp->s.size = nu;
++  free((void*)(hp + 1));
+   return freep;
+ }
+ 
+-// user program's general purpose storage allocator
+-void* malloc(uint nbytes) {
++void*
++malloc(uint nbytes)
++{
+   Header *p, *prevp;
++  uint nunits;
+ 
+-  // Round up allocation size to fit header size (8 bytes).
+-  // nunits is the size of the malloc, represented as a multiple of 8.
+-  uint nunits = (nbytes + sizeof(Header) - 1)/sizeof(Header) + 1;
+-  // if there is no free list yet, set up a list with one empty block
++  nunits = (nbytes + sizeof(Header) - 1)/sizeof(Header) + 1;
+   if((prevp = freep) == 0){
+     base.s.ptr = freep = prevp = &base;
+     base.s.size = 0;
+   }
+-  // scan through the free list
+   for(p = prevp->s.ptr; ; prevp = p, p = p->s.ptr){
+-    // if it's big enough
+     if(p->s.size >= nunits){
+-      // if exactly the right size, remove from the list
+-      if(p->s.size == nunits){
++      if(p->s.size == nunits)
+         prevp->s.ptr = p->s.ptr;
+-      }
+-      // split the free block by allocating the tail end
+       else {
+-        p->s.size -= nunits;  // make the free block smaller
+-
+-        // Modify our copy of the free block's header "p"
+-	// to make it represent the newly allocated block.
+-	p += p->s.size;
++        p->s.size -= nunits;
++        p += p->s.size;
+         p->s.size = nunits;
+       }
+-      freep = prevp;  // change the start of the free list
+-                      // to implement the "next fit" policy
+-                      // (and a newly split block will be considered next)
+-      return (void*)(p + 1);  // allocated chunk, past the header
+-    }
+-    // if we looped around to list start again, no blocks are big enough
+-    if(p == freep) {
+-      // ask the OS for another chunk of free memory
+-      if((p = morecore(nunits)) == 0) {
+-        return 0;  // the memory allocation failed
+-      }
++      freep = prevp;
++      return (void*)(p + 1);
+     }
++    if(p == freep)
++      if((p = morecore(nunits)) == 0)
++        return 0;
+   }
+ }
+diff --git a/user/user.h b/user/user.h
+index 2b68ee0..8ae937b 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -2,6 +2,7 @@
+ #define _USER_H_
+ 
+ struct stat;
++struct Key;
+ 
+ // system calls
+ int fork(void);
+@@ -25,6 +26,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int tagFile(int, char*, char*, int);
++int removeFileTag(int, char*);
++int getFileTag(int, char*, char*, int);
++int getAllTags(int, struct Key*, int);
+ 
+ // user library functions (ulib.c)
+ int stat(char*, struct stat*);
+diff --git a/user/usertests.c b/user/usertests.c
+index 2586378..4c48100 100644
+--- a/user/usertests.c
++++ b/user/usertests.c
+@@ -1276,40 +1276,39 @@ sbrktest(void)
+ 
+   // can one allocate the full 640K?
+   a = sbrk(0);
+-  amt = (636 * 1024) - (uint)a;
++  amt = (640 * 1024) - (uint)a;
+   p = sbrk(amt);
+   if(p != a){
+     printf(stdout, "sbrk test failed 640K test, p %x a %x\n", p, a);
+     exit();
+   }
+-  lastaddr = (char*)(636 * 1024 - 1);
++  lastaddr = (char*)(640 * 1024 - 1);
+   *lastaddr = 99;
+ 
+   // is one forbidden from allocating more than 640K?
+-  c = sbrk(8192);
++  c = sbrk(4096);
+   if(c != (char*)0xffffffff){
+     printf(stdout, "sbrk allocated more than 640K, c %x\n", c);
+     exit();
+   }
+ 
+   // can one de-allocate?
+-  int changeAmt = 8192;
+   a = sbrk(0);
+-  c = sbrk(-changeAmt);
++  c = sbrk(-4096);
+   if(c == (char*)0xffffffff){
+     printf(stdout, "sbrk could not deallocate\n");
+     exit();
+   }
+   c = sbrk(0);
+-  if(c != a - changeAmt){
++  if(c != a - 4096){
+     printf(stdout, "sbrk deallocation produced wrong address, a %x c %x\n", a, c);
+     exit();
+   }
+ 
+   // can one re-allocate that page?
+   a = sbrk(0);
+-  c = sbrk(changeAmt);
+-  if(c != a || sbrk(0) != a + changeAmt){
++  c = sbrk(4096);
++  if(c != a || sbrk(0) != a + 4096){
+     printf(stdout, "sbrk re-allocation failed, a %x c %x\n", a, c);
+     exit();
+   }
+@@ -1319,7 +1318,7 @@ sbrktest(void)
+     exit();
+   }
+ 
+-  c = sbrk(8192);
++  c = sbrk(4096);
+   if(c != (char*)0xffffffff){
+     printf(stdout, "sbrk was able to re-allocate beyond 640K, c %x\n", c);
+     exit();
+@@ -1417,7 +1416,7 @@ validatetest(void)
+   printf(stdout, "validate test\n");
+   hi = 1100*1024;
+ 
+-  for(p = 4096; p <= (uint)hi; p += 4096){
++  for(p = 0; p <= (uint)hi; p += 4096){
+     if((pid = fork()) == 0){
+       // try to crash the kernel by passing in a badly placed integer
+       validateint((int*)p);
+diff --git a/user/usys.S b/user/usys.S
+index 8bfd8a1..8a262ac 100644
+--- a/user/usys.S
++++ b/user/usys.S
+@@ -29,3 +29,7 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(tagFile)
++SYSCALL(removeFileTag)
++SYSCALL(getFileTag)
++SYSCALL(getAllTags)
